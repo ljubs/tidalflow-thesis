@@ -188,12 +188,13 @@ static __global__ void buildLevelGraphKernel(const int *ver, const int *dst, con
     int localFrontierCount = 0;
     int localLevelEdgeCount = 0;
 
-    typedef cub::BlockScan<int, BLOCK_SIZE> BlockScan;
-    __shared__ typename BlockScan::TempStorage frontierCountScanStorage;
+    typedef cub::BlockScan<int, BLOCK_SIZE> BlockScan; // slags data struktur som lar oss gjøre prefix sum over en verdi per tråd i en blokk
+    __shared__ typename BlockScan::TempStorage frontierCountScanStorage; // midlertidig shared memory som BlockScan trenger for å jobbe
     __shared__ typename BlockScan::TempStorage levelEdgeCountScanStorage;
     __shared__ int blockFrontierBase;
     __shared__ int blockLevelEdgeBase;
 
+    // finner noder og nivåkanter
     if (threadId < frontierSize) { // threads outside of this range just wait
         int u = frontier[threadId];
         for (int e = ver[u]; e < ver[u + 1]; e++) {
@@ -213,14 +214,17 @@ static __global__ void buildLevelGraphKernel(const int *ver, const int *dst, con
 
     int frontierOffset = 0; // where this thread starts writing inside the block
     int levelEdgeOffset = 0;
-    int blockFrontierCount = 0;
+    int blockFrontierCount = 0; // hvor mange hele blokken fant
     int blockLevelEdgeCount = 0;
 
-    BlockScan(frontierCountScanStorage).ExclusiveSum(
-        localFrontierCount, frontierOffset, blockFrontierCount);
-    BlockScan(levelEdgeCountScanStorage).ExclusiveSum(
-        localLevelEdgeCount, levelEdgeOffset, blockLevelEdgeCount);
+    // leser localFrontierCount fra hver tråd, skriver frontierOffset for hver tråd,
+    // og blockFrontierCount blir totalen for hele blokken
+    // så basically scanner gjennom hvor mange noder/kanter hver tråd fant og plusser forrige prefix sum -> denne noden begynner å skrive fra denne offset'en
+    BlockScan(frontierCountScanStorage).ExclusiveSum(localFrontierCount, frontierOffset, blockFrontierCount);
+    BlockScan(levelEdgeCountScanStorage).ExclusiveSum(localLevelEdgeCount, levelEdgeOffset, blockLevelEdgeCount);
 
+
+    // her lagrer vi hvor vi skal skrive i next frontier == blockFrontierBase, også øker vi dem med blockFrontierCount
     if (threadIdx.x == 0) {
         // remember, atomicAdd returns the old val, so...
         // ... blockFrontierBase = nextFrontierSize, then does nextFrontierSize + blockFrontierCount
@@ -232,6 +236,7 @@ static __global__ void buildLevelGraphKernel(const int *ver, const int *dst, con
 
     if (threadId < frontierSize) {
         int u = frontier[threadId];
+        // vi har en base for hele blocken... også har hver tråd sin egen offset, legg det sammen og der skal de skrive i globale arrayen
         int frontierWrite = blockFrontierBase + frontierOffset;
         int levelEdgeWrite = blockLevelEdgeBase + levelEdgeOffset;
 
@@ -240,6 +245,8 @@ static __global__ void buildLevelGraphKernel(const int *ver, const int *dst, con
             int residual = capacity[e] - flow[e];
             if (residual <= 0 || dist[v] != nextLevel) continue;
 
+            // kun "kanten" som oppdaget noden får skrive den inn, hvis ikke kunne alle kanter
+            // som går inn i noden legge den inn i globale arrayen
             if (edgeThatDiscoveredVertex[v] == e)
                 nextFrontier[frontierWrite++] = v;
 

@@ -9,10 +9,11 @@ static inline long long minLongLong(long long a, long long b) { return (a < b) ?
 
 static inline int atomicCASInt(int *ptr, int expected, int desired) {
     int old = expected;
-    __atomic_compare_exchange_n(ptr, &old, desired, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+    __atomic_compare_exchange_n(ptr, &old, desired, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED); // GCC/Clang sin innebygde CAS operasjon
     return old;
 }
 
+// etterhvert så bruker vi jo cas på h[u] som kan bli veldig stor, så trenger egen cas
 static inline long long atomicCASLongLong(long long *ptr, long long expected, long long desired) {
     long long old = expected;
     __atomic_compare_exchange_n(ptr, &old, desired, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
@@ -34,7 +35,7 @@ static void markPrunedReach(Graph *g, const int *levelEdges, const int *levelVer
             int u = g->src[e];
             int v = g->dst[e];
             if (reach[v]) {
-                #pragma omp atomic write
+                #pragma omp atomic write // strengt tatt ikke nødvendig... går fint om flere skriver 1 her
                 reach[u] = 1;
             }
         }
@@ -58,6 +59,14 @@ static int compactLevelEdgesParallel(Graph *g, const int *levelEdges, int *compa
 
             if (reach[u] && reach[v]) {
                 int pos;
+                /*
+                husk:
+                atomic capture gjør to ting
+                låser {
+                    pos = writeCount; // fanger posisjonen den skal skrive de filtrerte nivåkantene på
+                    writeCount++; // også øker den writeCount for neste tråd som skal skrive
+                }
+                */
                 #pragma omp atomic capture
                 pos = writeCount++;
                 compactLevelEdges[pos] = e;
@@ -110,11 +119,11 @@ static int buildLevelGraph(Graph *g, int source, int sink,
                     int distV;
                     #pragma omp atomic read
                     distV = dist[v];
-                    if (distV == -1) {
+                    if (distV == -1) { // denne her trenger vi strengt tatt ikke
                         if (atomicCASInt(&dist[v], -1, nextLevel) == -1) {
                             myLocalNodes[localNodesSize++] = v;
                             distV = nextLevel;
-                        } else {
+                        } else { // i tilfelle den endret seg etter at vi sjekket at distV == -1
                             #pragma omp atomic read
                             distV = dist[v];
                         }
@@ -126,31 +135,32 @@ static int buildLevelGraph(Graph *g, int source, int sink,
                 }
             }
 
-            foundNodes[threadId] = localNodesSize;
-            foundLevelEdges[threadId] = localLevelEdgesSize;
+            foundNodes[threadId] = localNodesSize; // forteller hvor mange noder den fant
+            foundLevelEdges[threadId] = localLevelEdgesSize; // forteller hvor mange kanter den fant
             #pragma omp barrier
 
+            // PREFIX SUM STARTER HER
             int offsetNodes = 0;
             int offsetLevelEdges = levelEdgeBase;
             for (int t = 0; t < threadId; t++) {
                 offsetNodes += foundNodes[t];
                 offsetLevelEdges += foundLevelEdges[t];
-            }
+            } // teller opp gjennom prefix sum
 
-            if (threadId == omp_get_num_threads() - 1) {
+            if (threadId == omp_get_num_threads() - 1) { // siste tråden regner ut størrelsen på frontieren, fordi han regner ut totalen i prefix summen
+                // MÅ VÆRE SISTE
                 newSize = offsetNodes + localNodesSize;
                 levelEdgeCount = offsetLevelEdges + localLevelEdgesSize;
             }
 
+            // hver tråd tar sin memcpy nå, og kopierer over noder/kanter de fant til f.eks. global[offsetNodes] <- altså deres posisjon i global
             memcpy(&global[offsetNodes], myLocalNodes, (size_t)localNodesSize * sizeof(int));
-            memcpy(&levelEdges[offsetLevelEdges],
-                   myLocalLevelEdges,
-                   (size_t)localLevelEdgesSize * sizeof(int));
+            memcpy(&levelEdges[offsetLevelEdges], myLocalLevelEdges, (size_t)localLevelEdgesSize * sizeof(int));
         }
 
         globalSize = newSize;
         level++;
-        levelVer[level] = levelEdgeCount;
+        levelVer[level] = levelEdgeCount; // regner ut hvor mange kanter vi fant i dette nivået
         if (dist[sink] != -1) break;
     }
 
@@ -168,7 +178,7 @@ static int buildLevelGraph(Graph *g, int source, int sink,
     int write = compactLevelEdgesParallel(g, levelEdges, compactLevelEdges, oldLevelVer, levelVer, level, reach);
 
     *numLevels = level;
-    return (write > 0 && reach[source] != 0);
+    return (write > 0 && reach[source] != 0); // sjekker om vi kan nå sluket fra kilden, hvis ikke -> return false
 }
 
 static long long tideCycle(Graph *g, int source, int sink, int *levelEdges,
@@ -222,6 +232,11 @@ static long long tideCycle(Graph *g, int source, int sink, int *levelEdges,
                 int sendBack = (int)minLongLong((long long)remaining, minLongLong(lV, availableU));
                 if (sendBack <= 0) break;
 
+                /*
+                hvorfor remaining: vi lagrer hvor mye vi kan sende gjennom den kanten p[e]
+                - også er det mulig at vi sender i små biter, fordi vi kan oppdage at det er lite lV i første omgang, også senere finne ut at en tråd la tilbake litt flyt
+                - og dermed så kan vi prøve igjen, men aldri mer enn remaining, eller noen av de andre flaskehalsene i min(...)
+                */
                 if (atomicCASLongLong(&l[v], lV, lV - sendBack) == lV) {
                     if (atomicCASLongLong(&l[u], lU, lU + sendBack) == lU) {
                         sentTotal += sendBack;
@@ -250,9 +265,9 @@ static long long tideCycle(Graph *g, int source, int sink, int *levelEdges,
             int v = g->dst[edge];
             int reverseEdge = g->rev[edge];
 
-            int commitTotal = 0;
+            // int commitTotal = 0;
             int remaining = p[i];
-            while (remaining > 0) {
+            while (remaining > 0) { // ikke nødvendig egentlig, bruker bare samme mønster som i low tide, men her legger vi ikke tilbake så vi sender enten alt eller prøver igjen
                 long long hU;
                 #pragma omp atomic read
                 hU = h[u];
@@ -267,12 +282,12 @@ static long long tideCycle(Graph *g, int source, int sink, int *levelEdges,
                     g->flow[reverseEdge] -= commitFlow;
                     g->flow[edge] += commitFlow;
 
-                    commitTotal += commitFlow;
+                    // commitTotal += commitFlow;
                     remaining -= commitFlow;
                 }
             }
 
-            p[i] = commitTotal;
+            // p[i] = commitTotal;
         }
     }
 

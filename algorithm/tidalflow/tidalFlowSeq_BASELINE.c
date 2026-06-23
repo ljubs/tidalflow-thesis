@@ -19,6 +19,10 @@ static int buildLevelGraphBaseline(Graph *g, int source, int sink,
                                    int *queue) {
     memset(dist, -1, (size_t)g->nodeCount * sizeof(*dist));
 
+    /*
+    så vi bruker head som en "peker" for noden vi søker ut ifra, også bruker vi tail som en peker på noder vi legger til
+    ikke pekere som pointers, men peker på indekser
+    */
     int head = 0;
     int tail = 0;
 
@@ -27,10 +31,11 @@ static int buildLevelGraphBaseline(Graph *g, int source, int sink,
     dist[source] = 0;
     queue[tail++] = source;
 
-    while (head < tail) {
+    while (head < tail) { // når head == tail så betyr det at vi ikke har funnet nye noder == KØEN ER TOM og kan stoppe
         int levelEnd = tail;
 
-        while (head < levelEnd) {
+        // fant sink, men vi gjør ferdig alle nodene på dette nivået først.
+        while (head < levelEnd) { // fortsette å søke til head == levelEnd, fordi vi bygger nivågrafen nivå for nivå
             int u = queue[head++];
             int nextLevel = dist[u] + 1;
 
@@ -46,7 +51,7 @@ static int buildLevelGraphBaseline(Graph *g, int source, int sink,
                 }
 
                 if (dist[v] == nextLevel)
-                    levelEdges[(*levelEdgeCount)++] = e;
+                    levelEdges[(*levelEdgeCount)++] = e; // øk verdien som pointeren peker på
 
             }
         }
@@ -71,6 +76,7 @@ static long long tideCycleBaseline(Graph *g, int source, int sink,
         int v = g->dst[edge];
         int residual = g->capacity[edge] - g->flow[edge];
 
+        // bruker long long fordi vi forventer at h[u] kan bli svær, men residualen blir ikke nødvendigvis så stor, så bare caster det ned til int igjen fordi det brukes i p[idx]
         p[idx] = (int)minLongLong((long long)residual, h[u]);
         h[v] += p[idx];
     }
@@ -109,8 +115,8 @@ static long long tideCycleBaseline(Graph *g, int source, int sink,
         p[idx] = sent;
         h[u] -= sent;
         h[v] += sent;
-        g->flow[edge] += sent;
-        g->flow[rev] -= sent;
+        g->flow[edge] += sent; // her øker vi FLOWEN... dette er jo fordi vi ikke har egen residual[edge], så senere tar vi utregningen  capacity - flow <- så residualen blir mindre her
+        g->flow[rev] -= sent; // blir -flow, også når man tar residual = cap - flow så blir det jo cap + flow
     }
     if (stats != NULL) stats->erosionSeconds += tidalFlowSeqNowSeconds() - phaseStart;
 
@@ -120,6 +126,7 @@ static long long tideCycleBaseline(Graph *g, int source, int sink,
 long long tidalFlowSeq_BASELINE_STATS(Graph *g, int source, int sink, TidalFlowSeqStats *stats) {
     resetTidalFlowSeqStats(stats);
 
+    // size_t er en unsigned int kinda, slipper integer overflow
     const size_t nodeBytes = (size_t)g->nodeCount * sizeof(int);
     const size_t edgeBytes = (size_t)g->edgeCount * sizeof(int);
     const size_t tideBytes = (size_t)g->nodeCount * sizeof(long long);
@@ -131,6 +138,8 @@ long long tidalFlowSeq_BASELINE_STATS(Graph *g, int source, int sink, TidalFlowS
     int *p = (int *)malloc(edgeBytes);
     long long *l = (long long *)malloc(tideBytes);
 
+    // NULL her fordi -> hvis EN feiler så free'er vi alle!
+    // når du ikke får det minnet du BER om så kan en feile, da er det bedre å bare free alle
     if (levelEdges == NULL || dist == NULL || queue == NULL || h == NULL || p == NULL || l == NULL) {
         free(levelEdges);
         free(dist);
@@ -158,6 +167,7 @@ long long tidalFlowSeq_BASELINE_STATS(Graph *g, int source, int sink, TidalFlowS
             stats->tideCycleSeconds += tidalFlowSeqNowSeconds() - phaseStart;
         }
         phaseStart = tidalFlowSeqNowSeconds();
+        // husk at den hiver nivåkantene den finner i minneadressen som heter levelEdges
         hasLevelGraph = buildLevelGraphBaseline(g, source, sink, levelEdges, &levelEdgeCount, dist, queue);
         if (stats != NULL) {
             stats->bfsCount++;

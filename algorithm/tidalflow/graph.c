@@ -14,6 +14,7 @@ void initGraph(Graph *g, int n, int m) {
     g->nodeCount = n;
     g->edgeCount = m;
 
+    // så hvis m > 0 så allokerer vi minne til ver, src, dst whatever, if else = returner NULL
     g->ver = (int *)malloc((size_t)(n + 1) * sizeof(int));
     g->src = (m > 0) ? (int *)malloc((size_t)m * sizeof(int)) : NULL;
     g->dst = (m > 0) ? (int *)malloc((size_t)m * sizeof(int)) : NULL;
@@ -35,11 +36,11 @@ void initGraph(Graph *g, int n, int m) {
  * u v c  (1-indexed nodes)
  */
 void buildGraphFromStdin(Graph *g) {
-    int n, m;
+    int n, m; // starter med å spørre om n og m
     if (scanf("%d %d", &n, &m) != 2) {
         die("Invalid input header");
     }
-    initGraph(g, n, 2 * m);
+    initGraph(g, n, 2 * m); // allokerer minne til det
     Edge *edgeList = (Edge *)malloc((size_t)m * sizeof(Edge));
     if (edgeList == NULL) die("Edge list allocation failed");
 
@@ -47,7 +48,7 @@ void buildGraphFromStdin(Graph *g) {
         if (scanf("%d %d %d", &edgeList[i].u, &edgeList[i].v, &edgeList[i].c) != 3) {
             die("Invalid edge row");
         }
-        edgeList[i].u--;
+        edgeList[i].u--; // gjør den 0-indeksert
         edgeList[i].v--;
         if ((edgeList[i].u < 0) || (edgeList[i].u >= n) ||
             (edgeList[i].v < 0) || (edgeList[i].v >= n)) {
@@ -55,18 +56,23 @@ void buildGraphFromStdin(Graph *g) {
         }
     }
 
+    // leser degree per node, trengs for å bygge ver[]
     int *degree = (int *)calloc((size_t)g->nodeCount, sizeof(int));
     if (degree == NULL) die("Degree allocation failed");
     for (int i = 0; i < m; i++) {
-        degree[edgeList[i].u]++;
-        degree[edgeList[i].v]++;
+        degree[edgeList[i].u]++; // går gjennom hver kant og øker degrees til nodene
+        degree[edgeList[i].v]++; // husk at edgeList er en struct
     }
 
     g->ver[0] = 0;
     for (int i = 1; i <= n; i++) {
         g->ver[i] = g->ver[i - 1] + degree[i - 1];
+        // regner ut hvor node i sine kanter start
+        // så starter der forrige startet pluss antall utgående kanter den har (den forrige altså)
     }
 
+
+    // fyller på csr-arrayene
     int *nextPosition = (int *)calloc((size_t)n, sizeof(int));
     if (nextPosition == NULL) die("Position allocation failed");
     for (int i = 0; i < m; i++) {
@@ -120,12 +126,20 @@ static size_t nextPow2(size_t x) {
 
 static size_t findBucket(const PairBucket *table, size_t mask, unsigned long long key) {
     size_t slot = hashKey(key) & mask;
+    // linear probing: gå videre til vi finner tom slot eller samme key
     while ((table[slot].key != ULLONG_MAX) && (table[slot].key != key)) {
         slot = (slot + 1) & mask;
     }
     return slot;
 }
 
+/*
+ * Bygger g->rev ved å matche hver edge (u -> v) med edge (v -> u).
+ * Vi trenger denne koblingen for å kunne oppdatere motsatt residualkant
+ * når algoritmen sender flow gjennom en edge.
+ * Siden grafen ikke har direkte lookup fra (u, v) til edge-index, bruker vi
+ * en hash table. Uten den måtte vi søkt gjennom alle edges for hver edge.
+ */
 static int buildReverseEdgesByPairing(Graph *g, const char *path, int reportMissing) {
     const int m = g->edgeCount;
     const size_t tableSize = nextPow2((size_t)m + 1);
@@ -211,6 +225,19 @@ static void freeRawECL(RawECL *raw) {
     raw->m = 0;
 }
 
+/*
+ * Leser en ECL/.egr-fil inn i en midlertidig RawECL-struktur.
+ * Oppsettet i filen er:
+ *   int nodes
+ *   int edges
+ *   int ver[nodes + 1]
+ *   int edges[edges]
+ *   valgfritt: int weights[edges]
+ * ver og edges er CSR-formatet: ver[u]..ver[u + 1] peker på naboene til u.
+ * Hvis weights finnes, brukes de som kapasitet.
+ * Hvis weights mangler, lager vi tilfeldige kapasiteter med source som seed.
+ * Til slutt sjekker vi at CSR-arrayene og alle node-idene ser gyldige ut.
+ */
 static int readRawECL(const char *path, int source, RawECL *raw) {
     memset(raw, 0, sizeof(*raw));
 
@@ -307,6 +334,12 @@ static int readRawECL(const char *path, int source, RawECL *raw) {
     return 0;
 }
 
+/*
+ * Strict mode: bruker kantene akkurat slik de ligger i filen.
+ * Dette krever at filen allerede har begge retninger, altså både (u -> v)
+ * og (v -> u). Vi kopierer arrayene, fyller src[], og finner hvilke edges
+ * som er reverse av hverandre.
+ */
 static int buildGraphFromRawStrict(Graph *g, const RawECL *raw, const char *path, int reportMissing) {
     initGraph(g, raw->n, raw->m);
     memcpy(g->ver, raw->ver, (size_t)(raw->n + 1) * sizeof(int));
@@ -326,6 +359,12 @@ static int buildGraphFromRawStrict(Graph *g, const RawECL *raw, const char *path
     return 0;
 }
 
+/*
+ * Residual mode: brukes når filen bare har originalkantene.
+ * Da lager vi en ekstra reverse/residual edge for hver edge i filen.
+ * Original edge får kapasiteten fra filen, mens reverse edge starter med
+ * kapasitet 0. Derfor blir grafen dobbelt så stor: m -> 2*m.
+ */
 static int buildGraphFromRawResidual(Graph *g, const RawECL *raw) {
     if (raw->m > (INT_MAX / 2)) {
         fprintf(stderr, "Graph has too many edges to add residual reverse arcs\n");
@@ -386,13 +425,11 @@ static int buildGraphFromRawResidual(Graph *g, const RawECL *raw) {
 }
 
 /*
-* ECL binary CSR format:
-* [int nodes][int edges][int nindex[nodes+1]][int nlist[edges]][optional int eweight[edges]]
-*
-* Capacity assignment intentionally mirrors ECL-MaxFlow:
-* - if eweight exists: capacity[e] = abs(eweight[e])
-* - else: srand(source), capacity[e] = rand() % nodes
-*/
+ * Leser ECL/.egr-filen og bygger Graph med valgt reverse-edge strategi.
+ * REQUIRE_EXISTING: fila må allerede ha reverse edges.
+ * ADD_RESIDUAL: vi lager reverse edges selv med kapasitet 0.
+ * AUTO: prøver strict først, og lager residual edges hvis det mangler reverse edges.
+ */
 int buildGraphFromECLFileWithMode(Graph *g, const char *path, int source, int reverseMode) {
     memset(g, 0, sizeof(*g));
 
